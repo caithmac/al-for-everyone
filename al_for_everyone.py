@@ -2,608 +2,394 @@
 """
 Active Learning for Drug Discovery
 ===================================
-Self-contained script for chemists. No dependencies on explainable_al package.
+Self-contained script for chemists — choose your model, kernel, and protocol.
 
-HOW TO USE:
-  1. Edit the CONFIG section below (file paths, column names, settings)
-  2. Run: python al_for_everyone.py
+QUICK START:
+  python al_for_everyone.py --data my_data.csv --model gp
 
-WHAT IT DOES:
-  - Loads your CSV of compounds (SMILES + activity values)
-  - Computes ECFP4 fingerprints
-  - Runs active learning simulation (GP model picks compounds intelligently)
-  - Shows recall curves, R², Spearman, RMSE
-  - Optionally predicts activity for new, unlabeled compounds
-  - Saves everything to al_results/
+  # Or use a config file (recommended for repeatability):
+  python al_for_everyone.py @config.txt
 
-DEPENDENCIES:
-  pip install torch gpytorch rdkit-pypi pandas numpy scikit-learn scipy matplotlib tqdm
-  (Or use the 'al' conda environment if you have it)
+Full options: python al_for_everyone.py --help
 
-Author: Satya / MJ
-Date: May 2026
+Author: MJ / Satya — May 2026
 """
-
-import os
-import sys
-import warnings
-import numpy as np
-import pandas as pd
-import torch
-import gpytorch
-import matplotlib.pyplot as plt
+import os, sys, argparse, warnings, numpy as np, pandas as pd
 from tqdm import tqdm
-from sklearn.metrics import r2_score
-from scipy.stats import spearmanr
-from torch.distributions import Normal
-
-# ── Quiet mode ──────────────────────────────────────────────────────────────
 warnings.filterwarnings("ignore")
-from rdkit import RDLogger
-RDLogger.DisableLog("rdApp.*")
+from rdkit import RDLogger; RDLogger.DisableLog("rdApp.*")
 from rdkit import Chem
 from rdkit.Chem import AllChem
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import r2_score
+from scipy.stats import spearmanr
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CONFIG — Edit this section for your data
-# ═══════════════════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
+# KERNELS
+# ──────────────────────────────────────────────────────────────────────────────
 
-DATA_PATH      = "your_compounds.csv"    # Path to your CSV
-SMILES_COL     = "SMILES"                # Column with SMILES strings
-VALUE_COL      = "affinity"              # Column with activity values
-LOWER_IS_BETTER = False                  # True if lower = better (e.g., DDG, IC50)
-                                         # False if higher = better (e.g., pIC50)
+class TanimotoKernel:
+    """Tanimoto (Jaccard) similarity for binary fingerprint vectors."""
+    @staticmethod
+    def apply(x1, x2):
+        import torch
+        x1n = x1.pow(2).sum(-1, keepdim=True)
+        x2n = x2.pow(2).sum(-1, keepdim=True)
+        dot = torch.matmul(x1, x2.transpose(-1, -2))
+        return dot / (x1n + x2n.transpose(-1, -2) - dot).clamp(min=1e-9)
 
-# ── Active Learning Settings ─────────────────────────────────────────────────
-PROTOCOL       = "ucb-alternate"         # random | ucb-balanced | ucb-alternate |
-                                         # ucb-sandwich | ucb-explore-heavy |
-                                         # ucb-exploit-heavy | ucb-gradual
-KERNEL         = "tanimoto"              # tanimoto | rbf | matern
-INITIAL_SIZE   = 60                      # Random compounds to start with
-BATCH_SIZE     = 30                      # Compounds to pick each cycle
-N_CYCLES       = 10                      # Number of acquisition cycles
-EPOCHS         = 150                     # GP training epochs per cycle
-LR             = 0.01                    # Learning rate
-LR_DECAY       = 0.95                    # LR decay per epoch
+def get_gp_kernel(name):
+    """Return a gpytorch kernel by name."""
+    import torch, gpytorch
+    if name == "tanimoto":
+        class TK(gpytorch.kernels.Kernel):
+            def forward(self, x1, x2, diag=False, **params):
+                if diag: return torch.ones_like(x1[:, 0])
+                return TanimotoKernel.apply(x1, x2)
+        return gpytorch.kernels.ScaleKernel(TK())
+    elif name == "rbf":
+        return gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
+    elif name == "matern":
+        return gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=2.5))
+    raise ValueError(f"Unknown kernel: {name}")
 
-# ── Optional: Predict on new molecules ───────────────────────────────────────
-PREDICT_PATH       = ""                  # Path to CSV of unlabeled SMILES
-PREDICT_SMILES_COL = "smiles"            # Column name for SMILES in that file
+# ──────────────────────────────────────────────────────────────────────────────
+# GP MODEL
+# ──────────────────────────────────────────────────────────────────────────────
 
-# ── Output ───────────────────────────────────────────────────────────────────
-OUT_DIR        = "al_results"            # Where to save results
+def train_gp(train_x, train_y, kernel_name, epochs, lr, decay, device):
+    """Train an Exact GP. Returns (model, likelihood) in eval mode."""
+    import torch, gpytorch
+    from gpytorch.distributions import MultivariateNormal
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CORE: Tanimoto Kernel + GP Model
-# ═══════════════════════════════════════════════════════════════════════════════
+    class GPModel(gpytorch.models.ExactGP):
+        def __init__(self, tx, ty, lik):
+            super().__init__(tx, ty, lik)
+            self.mean = gpytorch.means.ConstantMean()
+            self.covar = get_gp_kernel(kernel_name)
+        def forward(self, x):
+            return MultivariateNormal(self.mean(x), self.covar(x).add_jitter(1e-6))
 
-class TanimotoKernel(gpytorch.kernels.Kernel):
-    """Tanimoto (Jaccard) kernel for binary fingerprint vectors.
+    tx = torch.tensor(train_x).float().to(device)
+    ty = torch.tensor(train_y).float().to(device)
+    lik = gpytorch.likelihoods.GaussianLikelihood().to(device)
+    model = GPModel(tx, ty, lik).to(device)
 
-    K(x1, x2) = (x1 · x2) / (||x1||² + ||x2||² - x1 · x2)
+    model.train(); lik.train()
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    sched = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=decay)
+    mll = gpytorch.mlls.ExactMarginalLogLikelihood(lik, model)
 
-    This is the only kernel that makes physical sense for ECFP fingerprints.
-    RBF/Matern use Euclidean distance, which is meaningless for binary vectors.
-    """
+    for _ in range(epochs):
+        opt.zero_grad()
+        loss = -mll(model(tx), ty)
+        loss.backward(); opt.step(); sched.step()
 
-    def forward(self, x1, x2, diag=False, **params):
-        if diag:
-            return torch.ones_like(x1[:, 0])
-        x1_norm = x1.pow(2).sum(dim=-1, keepdim=True)
-        x2_norm = x2.pow(2).sum(dim=-1, keepdim=True)
-        x1_dot_x2 = torch.matmul(x1, x2.transpose(-1, -2))
-        denominator = x1_norm + x2_norm.transpose(-1, -2) - x1_dot_x2
-        return x1_dot_x2 / denominator.clamp(min=1e-9)
+    model.eval(); lik.eval()
+    return model, lik
 
+# ──────────────────────────────────────────────────────────────────────────────
+# FINGERPRINTS
+# ──────────────────────────────────────────────────────────────────────────────
 
-class GPRegressionModel(gpytorch.models.ExactGP):
-    """GP regression model with constant mean and configurable kernel."""
-
-    def __init__(self, train_x, train_y, likelihood, kernel=None):
-        super().__init__(train_x, train_y, likelihood)
-        self.mean_module = gpytorch.means.ConstantMean()
-        if kernel is None:
-            self.covar_module = TanimotoKernel()
-        elif hasattr(kernel, 'get_kernel'):
-            self.covar_module = kernel.get_kernel()
-        else:
-            self.covar_module = kernel
-
-    def forward(self, x):
-        mean_x = self.mean_module(x)
-        covar_x = self.covar_module(x)
-        return gpytorch.distributions.MultivariateNormal(
-            mean_x, covar_x.add_jitter(1e-6)
-        )
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# TRAINING
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def train_gp_model(train_x, train_y, likelihood, model,
-                   epochs=50, lr=0.1, lr_decay=0.95):
-    """Train a GP model using Exact Marginal Log Likelihood + Adam."""
-    device = train_x.device
-    model = model.to(device)
-    likelihood = likelihood.to(device)
-
-    model.train()
-    likelihood.train()
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=lr_decay)
-    mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
-
-    losses = []
-    for i in range(epochs):
-        optimizer.zero_grad()
-        output = model(train_x)
-        loss = -mll(output, train_y)
-        losses.append(loss.item())
-        if (i + 1) % 10 == 0:
-            print(f"  Epoch {i+1}/{epochs} | Loss: {loss.item():.3f}")
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
-
-    return model, likelihood, losses
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# FEATURIZATION
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def smiles_to_ecfp8(smiles_list, radius=4, nBits=4096):
-    """Convert a list of SMILES strings to ECFP fingerprints.
-
-    Returns:
-        np.ndarray of shape (N, nBits), dtype=int8
-    """
-    fingerprints = []
-    for smiles in tqdm(smiles_list, desc="Computing ECFP fingerprints"):
-        mol = Chem.MolFromSmiles(smiles)
+def ecfp4(smiles_list):
+    """ECFP4 fingerprints as numpy array (N x 4096, int8)."""
+    fps = []
+    for smi in tqdm(smiles_list, desc="  ECFP4"):
+        mol = Chem.MolFromSmiles(smi)
+        arr = np.zeros(4096, dtype=np.int8)
         if mol:
-            fp = AllChem.GetMorganFingerprintAsBitVect(
-                mol, radius=radius, nBits=nBits
-            )
-            arr = np.zeros((nBits,), dtype=np.int8)
-            AllChem.DataStructs.ConvertToNumpyArray(fp, arr)
-            fingerprints.append(arr)
-        else:
-            fingerprints.append(np.zeros((nBits,), dtype=np.int8))
-    return np.vstack(fingerprints)
+            AllChem.DataStructs.ConvertToNumpyArray(
+                AllChem.GetMorganFingerprintAsBitVect(mol, 4, nBits=4096), arr)
+        fps.append(arr)
+    return np.vstack(fps)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ACQUISITION FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════════
+def chemeleon_fingerprints(smiles_list):
+    """CheMeleon foundation-model fingerprints via chemprop v2.2+."""
+    import torch
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "chemeleon_repo"))
+    from chemeleon_fingerprint import CheMeleonFingerprint
+    fp_gen = CheMeleonFingerprint(device=torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"))
+    bs = 1024
+    return np.concatenate([fp_gen(smiles_list[i:i+bs])
+                           for i in range(0, len(smiles_list), bs)]).astype(np.float32)
 
-def ucb_selection(fingerprints, model, likelihood, batch_size,
-                  alpha=1.0, beta=1.0, already_selected=None):
-    """Upper Confidence Bound — pick compounds with highest α·μ + β·σ."""
-    already_selected = already_selected or []
-    model.eval()
-    likelihood.eval()
-    with torch.no_grad(), gpytorch.settings.fast_pred_var():
-        pool_idx = list(set(range(len(fingerprints))) - set(already_selected))
-        device = next(model.parameters()).device
-        pool_fp = torch.tensor(
-            np.array([np.array(fp) for fp in fingerprints])[pool_idx]
-        ).float().to(device)
-        preds = likelihood(model(pool_fp))
-        ucb = alpha * preds.mean + beta * preds.stddev
-        best = torch.argsort(ucb, descending=True)[:batch_size]
-        return np.array(pool_idx)[best.cpu().numpy()]
+# ──────────────────────────────────────────────────────────────────────────────
+# PROTOCOL BUILDER
+# ──────────────────────────────────────────────────────────────────────────────
 
-
-def pi_selection(fingerprints, model, likelihood, batch_size,
-                 already_selected, current_best_y, xi=0.01):
-    """Probability of Improvement."""
-    already_selected = already_selected or []
-    model.eval()
-    likelihood.eval()
-    with torch.no_grad(), gpytorch.settings.fast_pred_var():
-        pool_idx = list(set(range(len(fingerprints))) - set(already_selected))
-        device = next(model.parameters()).device
-        pool_fp = torch.tensor(
-            np.array([np.array(fp) for fp in fingerprints])[pool_idx]
-        ).float().to(device)
-        preds = likelihood(model(pool_fp))
-        Z = (preds.mean - current_best_y - xi) / (preds.stddev + 1e-9)
-        pi = Normal(torch.tensor(0.0), torch.tensor(1.0)).cdf(Z)
-        best = torch.argsort(pi, descending=True)[:batch_size]
-        return np.array(pool_idx)[best.cpu().numpy()]
-
-
-def ei_selection(fingerprints, model, likelihood, batch_size,
-                 already_selected, current_best_y, xi=0.01):
-    """Expected Improvement."""
-    already_selected = already_selected or []
-    model.eval()
-    likelihood.eval()
-    with torch.no_grad(), gpytorch.settings.fast_pred_var():
-        pool_idx = list(set(range(len(fingerprints))) - set(already_selected))
-        device = next(model.parameters()).device
-        pool_fp = torch.tensor(
-            np.array([np.array(fp) for fp in fingerprints])[pool_idx]
-        ).float().to(device)
-        preds = likelihood(model(pool_fp))
-        mean, std = preds.mean, preds.stddev
-        Z = (mean - current_best_y - xi) / (std + 1e-9)
-        normal = Normal(torch.tensor(0.0), torch.tensor(1.0))
-        ei = (mean - current_best_y - xi) * normal.cdf(Z) + std * torch.exp(
-            normal.log_prob(Z))
-        best = torch.argsort(ei, descending=True)[:batch_size]
-        return np.array(pool_idx)[best.cpu().numpy()]
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# METRICS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def calculate_metrics(model, likelihood, test_x, test_y):
-    """Compute R² and Spearman correlation."""
-    model.eval()
-    likelihood.eval()
-    with torch.no_grad(), gpytorch.settings.fast_pred_var():
-        preds = likelihood(model(test_x)).mean
-    r2 = r2_score(test_y.cpu().numpy(), preds.cpu().numpy())
-    sp, _ = spearmanr(test_y.cpu().numpy(), preds.cpu().numpy())
-    return r2, sp
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ACTIVE LEARNING LOOP
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def active_learning(df, fingerprints, selection_protocol,
-                    epochs=150, lr=0.01, lr_decay=0.95,
-                    kernel_factory=None):
-    """Run the active learning simulation.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Must have columns: 'affinity', 'top_2p', 'top_5p'
-    fingerprints : np.ndarray
-        ECFP fingerprints, shape (N, 4096)
-    selection_protocol : list of (method, batch_size) tuples
-    kernel_factory : callable or None
-        Returns a gpytorch kernel instance
-
-    Returns
-    -------
-    cycle_results : list of dicts
-    selected_indices : list
-    all_predictions : list of np.ndarray
-    gp_model, likelihood : trained model objects
-    """
-    df = df.copy()
-
-    # Ensure top-k flags are clean integers
-    for col in ['top_2p', 'top_5p']:
-        df[col] = df[col].apply(
-            lambda x: 1 if x in [True, 'TRUE', 'True', 'true', 1, '1'] else 0
-        )
-
-    total_2p = df['top_2p'].sum()
-    total_5p = df['top_5p'].sum()
-    print(f"Dataset: {len(df)} cpds | top_2p={total_2p} ({100*total_2p/len(df):.1f}%) "
-          f"| top_5p={total_5p} ({100*total_5p/len(df):.1f}%)")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-
-    selected_df = pd.DataFrame(columns=df.columns)
-    top_2p_count = 0
-    top_5p_count = 0
-    already_selected = []
-    cycle_results = []
-    all_predictions = []
-
-    for cycle, (method, batch_size) in enumerate(selection_protocol):
-        # ── Selection ──────────────────────────────────────────────────
-        if method == "random":
-            available = list(set(range(len(df))) - set(already_selected))
-            new_idx = np.random.choice(available, size=batch_size, replace=False)
-        elif method == "ucb":
-            new_idx = ucb_selection(
-                fingerprints, gp_model, likelihood, batch_size,
-                alpha=1.0, beta=1.0, already_selected=already_selected
-            )
-        elif method == "explore":
-            new_idx = ucb_selection(
-                fingerprints, gp_model, likelihood, batch_size,
-                alpha=0.0, beta=1.0, already_selected=already_selected
-            )
-        elif method == "exploit":
-            new_idx = ucb_selection(
-                fingerprints, gp_model, likelihood, batch_size,
-                alpha=1.0, beta=0.0, already_selected=already_selected
-            )
-        else:
-            raise ValueError(f"Unknown method: {method}")
-
-        new_sel = df.iloc[new_idx]
-        selected_df = pd.concat([selected_df, new_sel])
-        top_2p_count += new_sel['top_2p'].sum()
-        top_5p_count += new_sel['top_5p'].sum()
-        already_selected.extend(list(new_idx))
-
-        # ── Train ──────────────────────────────────────────────────────
-        train_x = torch.tensor(
-            np.array([np.array(fp) for fp in fingerprints])[selected_df.index]
-        ).float().to(device)
-        train_y = torch.tensor(
-            selected_df['affinity'].values
-        ).float().to(device)
-
-        likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
-        kernel = kernel_factory() if kernel_factory else None
-        gp_model = GPRegressionModel(
-            train_x, train_y, likelihood, kernel=kernel
-        ).to(device)
-        gp_model, likelihood, _ = train_gp_model(
-            train_x, train_y, likelihood, gp_model, epochs, lr, lr_decay
-        )
-
-        # ── Evaluate ───────────────────────────────────────────────────
-        gp_model.eval()
-        likelihood.eval()
-        with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            all_x = torch.tensor(fingerprints).float().to(device)
-            predictions = likelihood(gp_model(all_x)).mean.cpu().numpy()
-
-        all_predictions.append(predictions)
-
-        r2, sp = calculate_metrics(
-            gp_model, likelihood, all_x,
-            torch.tensor(df['affinity'].values).float().to(device)
-        )
-        rmse = np.sqrt(np.mean((df['affinity'].values - predictions) ** 2))
-
-        cycle_results.append({
-            'cycle': cycle,
-            'method': method,
-            'top_2p': int(top_2p_count),
-            'top_5p': int(top_5p_count),
-            'top_2p_recall_cumulative': top_2p_count / total_2p if total_2p else 0,
-            'top_5p_recall_cumulative': top_5p_count / total_5p if total_5p else 0,
-            'r2': r2,
-            'spearman': sp,
-            'rmse': rmse,
-            'compounds_acquired': len(selected_df),
-        })
-
-        print(f"Cycle {cycle} ({method:>8s}): R²={r2:.3f}  Spearman={sp:.3f}  "
-              f"RMSE={rmse:.2f}  Acquired={len(selected_df)}  "
-              f"Top2%={top_2p_count}/{total_2p}  Top5%={top_5p_count}/{total_5p}")
-
-    return cycle_results, already_selected, all_predictions, gp_model, likelihood
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PLOTTING
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def plot_results(results_df, protocol_name, kernel_name, out_dir):
-    """Generate recall curves and model-quality plots."""
-    x = results_df["compounds_acquired"]
-
-    # ── Recall curves ─────────────────────────────────────────────────────
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    colors = {"top_2p_recall_cumulative": "#e74c3c",
-              "top_5p_recall_cumulative": "#f39c12"}
-    labels = {"top_2p_recall_cumulative": "Top 2%",
-              "top_5p_recall_cumulative": "Top 5%"}
-
-    for ax, col in zip(axes, ["top_2p_recall_cumulative", "top_5p_recall_cumulative"]):
-        ax.plot(x, results_df[col], "o-", color=colors[col], lw=2, ms=6)
-        ax.axhline(1.0, color="gray", ls="--", alpha=0.4, label="Perfect recall")
-        ax.set_xlabel("Compounds acquired")
-        ax.set_ylabel("Recall")
-        ax.set_title(labels[col])
-        ax.legend()
-        ax.set_ylim(0, 1.1)
-
-    fig.suptitle(f"Protocol: {protocol_name}  |  Kernel: {kernel_name}",
-                 fontsize=13, fontweight="bold")
-    plt.tight_layout()
-    plt.savefig(f"{out_dir}/recall_curves.png", dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"  → Saved {out_dir}/recall_curves.png")
-
-    # ── Model quality ──────────────────────────────────────────────────────
-    fig, axes = plt.subplots(1, 3, figsize=(14, 3.5))
-    axes[0].plot(x, results_df["r2"], "o-", color="#2980b9", lw=2, ms=6)
-    axes[0].set_xlabel("Compounds acquired")
-    axes[0].set_ylabel("R²")
-    axes[0].set_title("R² over cycles")
-
-    axes[1].plot(x, results_df["spearman"], "o-", color="#27ae60", lw=2, ms=6)
-    axes[1].set_xlabel("Compounds acquired")
-    axes[1].set_ylabel("Spearman ρ")
-    axes[1].set_title("Spearman over cycles")
-
-    axes[2].plot(x, results_df["rmse"], "o-", color="#e74c3c", lw=2, ms=6)
-    axes[2].set_xlabel("Compounds acquired")
-    axes[2].set_ylabel("RMSE")
-    axes[2].set_title("RMSE over cycles")
-
-    plt.tight_layout()
-    plt.savefig(f"{out_dir}/model_quality.png", dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"  → Saved {out_dir}/model_quality.png")
-
-
-def predict_pool(gp_model, likelihood, pool_smiles, lower_is_better, out_dir):
-    """Predict activity for a list of unlabeled SMILES using the trained GP."""
-    print(f"\nPredicting {len(pool_smiles)} unlabeled compounds...")
-    pool_fp = smiles_to_ecfp8(pool_smiles)
-    pool_tensor = torch.tensor(pool_fp).float()
-    device = next(gp_model.parameters()).device
-    pool_tensor = pool_tensor.to(device)
-
-    gp_model.eval()
-    likelihood.eval()
-    with torch.no_grad(), gpytorch.settings.fast_pred_var():
-        preds = likelihood(gp_model(pool_tensor))
-        pred_mean = preds.mean.cpu().numpy()
-        pred_std = preds.stddev.cpu().numpy()
-
-    if lower_is_better:
-        pred_value = -pred_mean  # undo negation
-    else:
-        pred_value = pred_mean
-
-    out = pd.DataFrame({
-        "SMILES": pool_smiles,
-        "predicted_value": pred_value,
-        "uncertainty": pred_std,
-    })
-
-    # Sort: best first
-    ascending = lower_is_better
-    out = out.sort_values("predicted_value", ascending=ascending).reset_index(drop=True)
-
-    out_path = f"{out_dir}/pool_predictions.csv"
-    out.to_csv(out_path, index=False)
-    print(f"  → Saved {out_path} ({len(out)} compounds)")
-
-    # Show top 20
-    top_n = min(20, len(out))
-    print(f"\nTop {top_n} predicted compounds:")
-    print(out.head(top_n)[["SMILES", "predicted_value", "uncertainty"]].to_string(index=False))
-    return out
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PROTOCOL BUILDERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def build_protocol(name, init_size, batch_size, n_cycles):
-    """Build a selection protocol from a name string."""
-    protocols = {
-        "random":           [("random", init_size)] + [("random", batch_size)] * n_cycles,
-        "ucb-balanced":     [("random", init_size)] + [("ucb", batch_size)] * n_cycles,
-        "ucb-alternate":    [("random", init_size)] + [
-            ("explore" if i % 2 == 0 else "exploit", batch_size) for i in range(n_cycles)
-        ],
-        "ucb-sandwich":     [("random", init_size)] + (
-            [("explore", batch_size)] * 2 +
-            [("exploit", batch_size)] * 6 +
-            [("explore", batch_size)] * 2
-        ),
-        "ucb-explore-heavy":[("random", init_size)] + (
-            [("explore", batch_size)] * 7 +
-            [("exploit", batch_size)] * 3
-        ),
-        "ucb-exploit-heavy":[("random", init_size)] + (
-            [("explore", batch_size)] * 3 +
-            [("exploit", batch_size)] * 7
-        ),
-        "ucb-gradual":      [("random", init_size)] + (
-            [("explore", batch_size)] * 3 +
-            [("ucb", batch_size)] * 4 +
-            [("exploit", batch_size)] * 3
-        ),
+def build_protocol(name, init, batch, rounds):
+    """Generate (method, batch_size) steps from a protocol name."""
+    base = {
+        "random":            ["random"] * (rounds + 1),
+        "ucb-balanced":      ["random"] + ["ucb"] * rounds,
+        "ucb-alternate":     ["random"] + [("explore" if i%2==0 else "exploit")
+                                           for i in range(rounds)],
+        "ucb-sandwich":      ["random"] + ["explore"]*2 + ["exploit"]*6 + ["explore"]*2,
+        "ucb-explore-heavy": ["random"] + ["explore"]*7 + ["exploit"]*3,
+        "ucb-exploit-heavy": ["random"] + ["explore"]*3 + ["exploit"]*7,
+        "ucb-gradual":       ["random"] + ["explore"]*3 + ["ucb"]*4 + ["exploit"]*3,
     }
-    return protocols.get(name, protocols["ucb-balanced"])
+    ms = base.get(name, base["ucb-alternate"])
+    return list(zip(ms, [init] + [batch] * (len(ms) - 1)))
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
+# ACTIVE LEARNING
+# ──────────────────────────────────────────────────────────────────────────────
+
+def run_al(fingerprints, target, top2_idx, top5_idx, steps, model_name, kernel,
+           gp_epochs, gp_lr, gp_lr_decay, rf_trees, seed, device):
+    """Run AL loop. Returns (records, selected_indices, final_model, likelihood)."""
+    cnt2 = cnt5 = 0
+    selected = []
+    records = []
+    model = lik = rf = None  # will be set after first training
+
+    for rnd, (method, batch) in enumerate(steps):
+        avail = [i for i in range(len(target)) if i not in selected]
+
+        if method == "random":
+            new_idx = list(np.random.RandomState(seed + rnd).choice(
+                avail, batch, replace=False))
+
+        else:
+            # Use existing model for UCB prediction
+            if model_name == "gp":
+                import torch, gpytorch
+                with torch.no_grad(), gpytorch.settings.fast_pred_var():
+                    ax = torch.tensor(fingerprints[avail]).float().to(device)
+                    preds = lik(model(ax))
+                    mu = preds.mean.cpu().numpy()
+                    sigma = preds.stddev.cpu().numpy()
+            else:
+                tp = np.array([t.predict(fingerprints[avail])
+                               for t in rf.estimators_])
+                mu = tp.mean(axis=0); sigma = tp.std(axis=0)
+
+            a = 1.0 if method in ("ucb", "exploit") else 0.0
+            b = 1.0 if method in ("ucb", "explore") else 0.0
+            scores = a * mu + b * sigma
+            new_idx = [avail[int(i)] for i in np.argsort(scores)[-batch:]]
+
+        selected.extend(new_idx)
+
+        # ── Train model on all selected ──
+        sx = fingerprints[selected]
+        sy = target.iloc[selected].values
+        if model_name == "gp":
+            model, lik = train_gp(sx, sy, kernel, gp_epochs,
+                                  gp_lr, gp_lr_decay, device)
+        else:
+            rf = RandomForestRegressor(n_estimators=rf_trees, min_samples_leaf=2,
+                                       n_jobs=-1, random_state=seed + rnd)
+            rf.fit(sx, sy)
+
+        # ── Track recall ──
+        cnt2 += sum(1 for i in new_idx if i in top2_idx)
+        cnt5 += sum(1 for i in new_idx if i in top5_idx)
+
+        # ── Evaluate on remaining ──
+        remaining = sorted(set(range(len(target))) - set(selected))
+        if remaining:
+            if model_name == "gp":
+                import torch, gpytorch
+                with torch.no_grad(), gpytorch.settings.fast_pred_var():
+                    rfp = torch.tensor(fingerprints[remaining]).float().to(device)
+                    rm = lik(model(rfp)).mean.cpu().numpy()
+            else:
+                rm = rf.predict(fingerprints[remaining])
+            rt = target.iloc[remaining].values
+            r2 = r2_score(rt, rm)
+            sp, _ = spearmanr(rt, rm)
+        else:
+            r2 = sp = 0.0
+
+        print(f"  R{rnd:2d} {method:>12s}: trained={len(selected):3d}  "
+              f"R²={r2:.3f}  ρ={sp:.3f}  "
+              f"top2={cnt2}/{len(top2_idx)}  top5={cnt5}/{len(top5_idx)}")
+        records.append({"round": rnd, "method": method, "trained": len(selected),
+                        "r2": round(r2,3), "spearman": round(sp,3),
+                        "top2": cnt2, "top5": cnt5})
+
+    # Final model on all selected
+    if model_name == "gp":
+        final_model, final_lik = train_gp(
+            fingerprints[selected], target.iloc[selected].values,
+            kernel, gp_epochs, gp_lr, gp_lr_decay, device)
+    else:
+        final_model = RandomForestRegressor(n_estimators=rf_trees, min_samples_leaf=2,
+                                            n_jobs=-1, random_state=seed)
+        final_model.fit(fingerprints[selected], target.iloc[selected].values)
+        final_lik = None
+
+    return records, selected, final_model, final_lik
+
+# ──────────────────────────────────────────────────────────────────────────────
 # MAIN
-# ═══════════════════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
 
 def main():
-    print("=" * 72)
+    import torch
+    p = argparse.ArgumentParser(
+        description="Active Learning for Drug Discovery",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  # Config files (one flag per line):
+  python al_for_everyone.py --config config.txt
+  python al_for_everyone.py --data tyk2.csv --model gp --kernel tanimoto \\
+    --protocol ucb-alternate --lower=True --library virtual.csv
+
+Config files: one flag per line (e.g. --model gp on its own line).
+Run: python al_for_everyone.py @config.txt""")
+    p.add_argument("--data", default="my_compounds.csv")
+    p.add_argument("--smiles_col", default="SMILES")
+    p.add_argument("--val_col", default="calc_DDG_kcal")
+    p.add_argument("--lower", default="True")
+    p.add_argument("--library", default="")
+    p.add_argument("--library_smi_col", default="smiles")
+    p.add_argument("--top_n", type=int, default=1000)
+    p.add_argument("--model", default="gp", choices=["gp","rf","chemeleon"])
+    p.add_argument("--kernel", default="tanimoto", choices=["tanimoto","rbf","matern"])
+    p.add_argument("--protocol", default="ucb-alternate",
+                   choices=["random","ucb-balanced","ucb-alternate","ucb-sandwich",
+                            "ucb-explore-heavy","ucb-exploit-heavy","ucb-gradual"])
+    p.add_argument("--ucb_beta", type=float, default=2.0)
+    p.add_argument("--init_size", type=int, default=60)
+    p.add_argument("--batch_size", type=int, default=30)
+    p.add_argument("--n_rounds", type=int, default=10)
+    p.add_argument("--gp_epochs", type=int, default=150)
+    p.add_argument("--gp_lr", type=float, default=0.01)
+    p.add_argument("--gp_lr_decay", type=float, default=0.95)
+    p.add_argument("--rf_trees", type=int, default=500)
+    p.add_argument("--out", default="al_results")
+    p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--config", default="",
+                   help="Config file path (one flag per line)")
+    args = p.parse_args()
+
+    # Config file support
+    if args.config:
+        with open(args.config) as f:
+            lines = [l.strip() for l in f if l.strip() and not l.startswith('#')]
+        import shlex
+        args = p.parse_args(shlex.split(' '.join(lines)) + sys.argv[1:])
+
+    lower_better = args.lower.strip().lower() in ("true","yes","1","t")
+    os.makedirs(args.out, exist_ok=True)
+
+    print(f"\n{'='*65}")
     print("  Active Learning for Drug Discovery")
-    print("=" * 72)
+    print(f"{'='*65}")
+    print(f"  Data:     {args.data}")
+    print(f"  Model:    {args.model.upper()}  |  Kernel: {args.kernel}")
+    print(f"  Protocol: {args.protocol}  |  Budget: {args.init_size}+{args.n_rounds}x{args.batch_size}")
+    if args.library:
+        print(f"  Library:  {args.library}  →  Top {args.top_n}")
+    print(f"{'='*65}")
 
-    # ── 1. Load data ────────────────────────────────────────────────────────
-    print(f"\n[1/6] Loading data: {DATA_PATH}")
-    df = pd.read_csv(DATA_PATH)
-    df = df.rename(columns={SMILES_COL: "SMILES"})
-    df = df.dropna(subset=["SMILES", VALUE_COL]).reset_index(drop=True)
-    print(f"      {len(df)} compounds loaded")
+    # ── Load data ──
+    df = pd.read_csv(args.data)[[args.smiles_col, args.val_col]].dropna()
+    df.columns = ["SMILES", "value"]
+    target = -df["value"] if lower_better else df["value"]
+    sort_asc = lower_better
+    print(f"\nLoaded: {len(df)} compounds  |  lower_is_better={lower_better}")
 
-    # Handle direction
-    if LOWER_IS_BETTER:
-        df["affinity"] = -df[VALUE_COL].values
-        print(f"      Negated '{VALUE_COL}' → affinity (lower=better → GP maximises)")
+    n_top2 = max(1, int(0.02 * len(df)))
+    n_top5 = max(1, int(0.05 * len(df)))
+    top2_idx = set(target.nlargest(n_top2).index)
+    top5_idx = set(target.nlargest(n_top5).index)
+    print(f"Top-2%: {n_top2}  |  Top-5%: {n_top5}")
+
+    # ── Fingerprints ──
+    print("\nFingerprinting...")
+    if args.model == "chemeleon":
+        try:
+            fingerprints = chemeleon_fingerprints(df["SMILES"].tolist())
+            print(f"  CheMeleon: {fingerprints.shape}  ✓")
+        except ImportError:
+            print("  CheMeleon not available → ECFP fallback")
+            fingerprints = ecfp4(df["SMILES"].tolist())
+            print(f"  ECFP4: {fingerprints.shape}  ✓")
     else:
-        df["affinity"] = df[VALUE_COL].values
-        print(f"      Using '{VALUE_COL}' as affinity (higher=better)")
+        fingerprints = ecfp4(df["SMILES"].tolist())
+        print(f"  ECFP4: {fingerprints.shape}  ✓")
 
-    # Clip extreme outliers
-    LOW, HIGH = -15, 15
-    before = len(df)
-    df = df[(df["affinity"] >= LOW) & (df["affinity"] <= HIGH)].reset_index(drop=True)
-    if before != len(df):
-        print(f"      Clipped outliers: {before} → {len(df)} compounds")
+    # ── Protocol ──
+    steps = build_protocol(args.protocol, args.init_size, args.batch_size, args.n_rounds)
+    print(f"\nProtocol: {args.protocol}  |  {sum(b for _,b in steps)} total selections")
 
-    # Compute top-k flags
-    for frac, name in [(0.02, "top_2p"), (0.05, "top_5p")]:
-        n = max(1, int(frac * len(df)))
-        idx = df["affinity"].nlargest(n).index
-        df[name] = 0
-        df.loc[idx, name] = 1
+    # ── Run AL ──
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if args.model == "gp" else "cpu"
+    records, selected, final_model, final_lik = run_al(
+        fingerprints, target, top2_idx, top5_idx, steps,
+        args.model, args.kernel, args.gp_epochs, args.gp_lr, args.gp_lr_decay,
+        args.rf_trees, args.seed, device)
 
-    # ── 2. Featurize ────────────────────────────────────────────────────────
-    print(f"\n[2/6] Computing ECFP4 fingerprints...")
-    fingerprints = smiles_to_ecfp8(df["SMILES"].tolist())
-    print(f"      Shape: {fingerprints.shape}")
+    # ── Honest test ──
+    remaining = sorted(set(range(len(df))) - set(selected))
+    if remaining:
+        if args.model == "gp":
+            import torch, gpytorch
+            with torch.no_grad(), gpytorch.settings.fast_pred_var():
+                rfp = torch.tensor(fingerprints[remaining]).float().to(device)
+                rp = final_lik(final_model(rfp)).mean.cpu().numpy()
+        else:
+            rp = final_model.predict(fingerprints[remaining])
+        if lower_better:
+            rp = -rp
+        rt = df["value"].iloc[remaining].values
+        r2 = r2_score(rt, rp)
+        sp, _ = spearmanr(rt, rp)
+        print(f"\n{'='*65}")
+        print(f"  Honest test — {len(remaining)} unseen compounds:")
+        print(f"  R²={r2:.4f}  Spearman={sp:.4f}")
+        pd.DataFrame({"SMILES": df["SMILES"].iloc[remaining].values,
+                      "true": rt, "predicted": rp}).to_csv(
+            f"{args.out}/honest_test.csv", index=False)
+        print(f"  → {args.out}/honest_test.csv")
 
-    # ── 3. Build protocol + kernel ──────────────────────────────────────────
-    print(f"\n[3/6] Protocol: {PROTOCOL}  |  Kernel: {KERNEL}")
-    protocol = build_protocol(PROTOCOL, INITIAL_SIZE, BATCH_SIZE, N_CYCLES)
+    pd.DataFrame(records).to_csv(f"{args.out}/al_summary.csv", index=False)
+    print(f"  → {args.out}/al_summary.csv")
 
-    kernels = {
-        "tanimoto": lambda: TanimotoKernel(),
-        "rbf": lambda: gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel()),
-        "matern": lambda: gpytorch.kernels.ScaleKernel(
-            gpytorch.kernels.MaternKernel(nu=2.5)
-        ),
-    }
-    kernel_fn = kernels.get(KERNEL, kernels["tanimoto"])
+    # ── Library screening ──
+    if args.library and os.path.exists(args.library):
+        lib = pd.read_csv(args.library)
+        lib_smi = lib[args.library_smi_col].tolist()
+        print(f"\nScreening {len(lib):,} compounds...")
 
-    # ── 4. Run AL ───────────────────────────────────────────────────────────
-    print(f"\n[4/6] Running active learning ({len(protocol)} cycles)...")
-    print("-" * 72)
-    results, selected_idx, all_preds, gp_model, likelihood = active_learning(
-        df, fingerprints, protocol,
-        epochs=EPOCHS, lr=LR, lr_decay=LR_DECAY,
-        kernel_factory=kernel_fn,
-    )
-    print("-" * 72)
+        if args.model == "chemeleon":
+            try:
+                fps = chemeleon_fingerprints(lib_smi)
+            except ImportError:
+                fps = ecfp4(lib_smi)
+        else:
+            fps = ecfp4(lib_smi)
 
-    results_df = pd.DataFrame(results)
+        if args.model == "gp":
+            import torch, gpytorch
+            gp_batch = 2048
+            all_preds = []
+            for i in range(0, len(fps), gp_batch):
+                with torch.no_grad(), gpytorch.settings.fast_pred_var():
+                    bfp = torch.tensor(fps[i:i+gp_batch]).float().to(device)
+                    all_preds.append(final_lik(final_model(bfp)).mean.cpu().numpy())
+            lpred = np.concatenate(all_preds)
+        else:
+            lpred = final_model.predict(fps)
+        if lower_better:
+            lpred = -lpred
 
-    # ── 5. Save + plot ──────────────────────────────────────────────────────
-    print(f"\n[5/6] Saving results to {OUT_DIR}/")
-    os.makedirs(OUT_DIR, exist_ok=True)
+        ranked = pd.DataFrame({"SMILES": lib_smi, "predicted": lpred})
+        ranked = ranked.sort_values("predicted", ascending=sort_asc).reset_index(drop=True)
+        ranked.head(args.top_n).to_csv(f"{args.out}/top_candidates.csv", index=False)
+        print(f"  → {args.out}/top_candidates.csv (top {args.top_n})")
+        for i, row in ranked.head(10).iterrows():
+            print(f"  {i+1:3d}.  {row['predicted']:7.3f}  {row['SMILES'][:60]}...")
 
-    results_df.to_csv(f"{OUT_DIR}/cycle_results.csv", index=False)
-
-    # Selected compounds
-    selected = df.iloc[selected_idx].copy()
-    selected.to_csv(f"{OUT_DIR}/selected_compounds.csv", index=False)
-
-    print(f"\nFinal results:")
-    print(results_df[["cycle", "method", "compounds_acquired",
-                       "r2", "spearman", "rmse",
-                       "top_2p", "top_5p"]].to_string(index=False))
-
-    plot_results(results_df, PROTOCOL, KERNEL, OUT_DIR)
-
-    # ── 6. Predict on pool (optional) ───────────────────────────────────────
-    if PREDICT_PATH and os.path.exists(PREDICT_PATH):
-        print(f"\n[6/6] Predicting on unlabeled pool: {PREDICT_PATH}")
-        pool_df = pd.read_csv(PREDICT_PATH)
-        pool_df = pool_df.rename(columns={PREDICT_SMILES_COL: "SMILES"})
-        pool_df = pool_df.dropna(subset=["SMILES"]).reset_index(drop=True)
-        pool_smiles = pool_df["SMILES"].tolist()
-        predict_pool(gp_model, likelihood, pool_smiles, LOWER_IS_BETTER, OUT_DIR)
-    else:
-        print(f"\n[6/6] No PREDICT_PATH set — skipping pool predictions.")
-
-    print(f"\n{'=' * 72}")
-    print(f"  ✅ Done! All results in: {OUT_DIR}/")
-    print(f"{'=' * 72}")
-
+    print(f"\n{'='*65}")
+    print("  Done! Send top_candidates.csv to your testing lab.")
+    print("=" * 65)
 
 if __name__ == "__main__":
     main()

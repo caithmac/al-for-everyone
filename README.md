@@ -1,91 +1,135 @@
 # Active Learning for Drug Discovery
 
-A single Python script that uses Gaussian Processes to intelligently pick
-which compounds to test next — no ML expertise needed.
+Pick the best compounds from your virtual library for testing.
+Choose your model, kernel, and protocol — or use the defaults.
 
-## Quick Start
+## Quick start
 
-1. **Install dependencies** (once):
-   ```
-   pip install torch gpytorch rdkit-pypi pandas numpy scikit-learn scipy matplotlib tqdm
-   ```
+```bash
+# 1. Create environment
+conda create -n al python=3.11 -y
+conda activate al
 
-2. **Prepare your data** — a CSV file with at least two columns:
-   - SMILES strings
-   - Activity values (pIC50, IC50, DDG, %inhibition, etc.)
+# 2. Install dependencies (choose one or all)
 
-3. **Edit the config** at the top of `al_for_everyone.py`:
-   - `DATA_PATH` — path to your CSV
-   - `SMILES_COL` — name of the SMILES column
-   - `VALUE_COL` — name of the activity column
-   - `LOWER_IS_BETTER` — True if lower values = better (e.g., IC50, DDG)
-   - Pick a protocol and kernel (defaults work well)
+# Basic (ECFP fingerprints + GP or RF — works for most users):
+pip install torch gpytorch rdkit-pypi pandas numpy scikit-learn scipy matplotlib tqdm
 
-4. **Run:**
-   ```
-   python al_for_everyone.py
-   ```
+# CheMeleon (better accuracy, optional):
+pip install "chemprop>=2.2.0"
 
-5. **Check `al_results/`** for outputs:
-   - `cycle_results.csv` — per-cycle metrics
-   - `selected_compounds.csv` — which compounds were picked
-   - `recall_curves.png` — how many top compounds were found
-   - `model_quality.png` — R², Spearman, RMSE over cycles
-   - `pool_predictions.csv` — predictions on new molecules (optional)
+# 3. Run
+python al_for_everyone.py --data my_compounds.csv --model gp
+```
 
-## What's Inside
+## CLI usage
 
-Everything is in ONE file — no imports from messy codebases:
+```bash
+# Minimal
+python al_for_everyone.py --data my_data.csv
 
-| Section | What it does |
-|---------|-------------|
-| **TanimotoKernel** | Jaccard similarity kernel — the only one that works for fingerprints |
-| **GP model** | Gaussian Process with constant mean |
-| **Featurization** | SMILES → ECFP4 fingerprints (4096 bits) |
-| **Acquisition** | UCB (α·μ + β·σ), Probability of Improvement, Expected Improvement |
-| **Active learning** | Iterative: pick → train → predict → repeat |
-| **Plots** | Recall curves, R²/Spearman/RMSE over cycles |
-| **Pool prediction** | Predict activity for new, unlabeled compounds |
+# Choose model, kernel, protocol
+python al_for_everyone.py --data my_data.csv --model chemeleon \
+    --protocol ucb-alternate --lower=True
 
-## Protocols
+# Screen a virtual library
+python al_for_everyone.py --data measured.csv --library virtual_library.csv \
+    --model rf --top_n 500
 
-| Name | Strategy |
+# Use a config file (recommended for repeatability)
+python al_for_everyone.py --config config.txt
+```
+
+### Config file format (`config.txt`)
+```
+--data my_compounds.csv
+--smiles_col SMILES
+--val_col calc_DDG_kcal
+--lower=True
+--model gp
+--kernel tanimoto
+--protocol ucb-alternate
+--init_size 60
+--batch_size 30
+--n_rounds 10
+--library virtual_library.csv
+--library_smi_col smiles
+--top_n 1000
+--out al_results
+```
+Usage: `python al_for_everyone.py --config config.txt`
+
+## All options
+
+| Flag | Default | Choices | Description |
+|------|---------|---------|-------------|
+| `--data` | `my_compounds.csv` | | Your CSV with measured compounds |
+| `--smiles_col` | `SMILES` | | Column with SMILES |
+| `--val_col` | `calc_DDG_kcal` | | Column with measured activity |
+| `--lower` | `True` | `True`/`False` | True = lower is better (DDG, IC50) |
+| `--library` | (empty) | | CSV of untested SMILES to screen |
+| `--library_smi_col` | `smiles` | | SMILES column in library |
+| `--top_n` | `1000` | | Top candidates to save |
+| `--model` | `gp` | `gp`, `rf`, `chemeleon` | Predictor model |
+| `--kernel` | `tanimoto` | `tanimoto`, `rbf`, `matern` | GP kernel (only for `--model gp`) |
+| `--protocol` | `ucb-alternate` | See below | Selection strategy |
+| `--ucb_beta` | `2.0` | | Exploration weight |
+| `--init_size` | `60` | | Random start size |
+| `--batch_size` | `30` | | Picks per round |
+| `--n_rounds` | `10` | | Selection rounds |
+| `--gp_epochs` | `150` | | GP training epochs |
+| `--gp_lr` | `0.01` | | GP learning rate |
+| `--gp_lr_decay` | `0.95` | | GP LR decay |
+| `--rf_trees` | `500` | | RF trees |
+| `--out` | `al_results` | | Output folder |
+| `--seed` | `7` | | Random seed |
+
+### Protocols
+
+| Protocol | Strategy |
+|----------|----------|
+| `random` | Pick randomly |
+| `ucb-balanced` | Always UCB (α=1, β=1) |
+| `ucb-alternate` | **Default.** Explore ↔ exploit, alternating |
+| `ucb-sandwich` | Explore → exploit → explore |
+| `ucb-explore-heavy` | More exploration |
+| `ucb-exploit-heavy` | More exploitation |
+| `ucb-gradual` | Explore → UCB → exploit |
+
+### Models
+
+| Model | Description | Needs |
+|-------|-------------|-------|
+| `gp` | **Default.** Gaussian Process with Tanimoto kernel on ECFP fingerprints. Best for small datasets (<2000). | `torch gpytorch rdkit-pypi` |
+| `rf` | Random Forest on ECFP fingerprints. Fast, no GPU needed. | `rdkit-pypi scikit-learn` |
+| `chemeleon` | **Best accuracy.** CheMeleon foundation-model fingerprints + Random Forest. R² up to 0.575 vs 0.438 for GP. | `chemprop>=2.2.0` + git clone the chemeleon_repo |
+
+## Output
+
+| File | Contents |
 |------|----------|
-| `random` | Random selection (baseline) |
-| `ucb-balanced` | UCB with equal explore/exploit weight |
-| `ucb-alternate` | Alternating explore/exploit cycles (best on TYK2) |
-| `ucb-sandwich` | 2 explore → 6 exploit → 2 explore |
-| `ucb-explore-heavy` | 7 explore → 3 exploit |
-| `ucb-exploit-heavy` | 3 explore → 7 exploit |
-| `ucb-gradual` | explore → UCB → exploit transition |
+| `al_results/al_summary.csv` | Round-by-round metrics (R², recall, picks) |
+| `al_results/honest_test.csv` | Predicted vs true on compounds the model never saw |
+| `al_results/top_candidates.csv` | Ranked library compounds, sorted by predicted activity |
 
-## Kernels
+## Files in this folder
 
-| Kernel | Best for |
-|--------|----------|
-| `tanimoto` | ECFP fingerprints (recommended!) |
-| `rbf` | Continuous descriptors (not fingerprints) |
-| `matern` | Smooth functions (not recommended for fingerprints) |
+| File | Purpose |
+|------|---------|
+| `al_for_everyone.py` | The script — everything in one file |
+| `chemeleon_repo/` | CheMeleon fingerprint code (needed for `--model chemeleon`) |
+| `README.md` | This file |
 
-## Tips
+## CheMeleon setup (optional)
 
-- **Start with the defaults** — `ucb-alternate` + `tanimoto` works great
-- **Small dataset?** Reduce `INITIAL_SIZE` to 20-30
-- **Large dataset (>2000 compounds)?** Consider fewer cycles or a sparse GP
-- **Check the uncertainty column** — high uncertainty = the model wants you to test that compound
+For best accuracy, clone the CheMeleon fingerprint repo next to the script:
 
-## Troubleshooting
+```bash
+git clone https://github.com/JacksonBurns/CheMeleon.git chemeleon_repo
+pip install "chemprop>=2.2.0"
+```
 
-**"No module named rdkit"**
-→ Install with conda: `conda install -c conda-forge rdkit`
-  Or pip: `pip install rdkit-pypi`
-
-**Out of memory**
-→ Your dataset is too large. Reduce `N_CYCLES` or use fewer compounds.
-
-**Slow featurization**
-→ Normal for >10k compounds. ECFP computation takes time.
-
----
-
-*Built for Lindsey & the chemistry team. May 2026.*
+Then run:
+```bash
+python al_for_everyone.py --data my.csv --model chemeleon
+```
