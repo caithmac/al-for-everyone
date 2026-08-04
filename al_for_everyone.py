@@ -136,6 +136,7 @@ def build_protocol(name, init, batch, rounds):
         "ucb-gradual":       ["random"] + ["explore"]*3 + ["ucb"]*4 + ["exploit"]*3,
     }
     ms = base.get(name, base["ucb-alternate"])
+    ms = (ms + [ms[-1]] * (rounds + 1 - len(ms)))[:rounds + 1]
     return list(zip(ms, [init] + [batch] * (len(ms) - 1)))
 
 # ──────────────────────────────────────────────────────────────────────────────

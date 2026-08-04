@@ -3,6 +3,8 @@
 Pick the best compounds from your virtual library for testing.
 Choose your model, kernel, and protocol — or use the defaults.
 
+![Active Learning for Everyone Streamlit interface](streamlit_ui.png)
+
 ## Quick start
 
 ```bash
@@ -20,6 +22,10 @@ pip install "chemprop>=2.2.0"
 
 # 3. Run
 python al_for_everyone.py --data my_compounds.csv --model gp
+
+# Optional visual interface
+pip install streamlit
+streamlit run streamlit_app.py
 ```
 
 ## CLI usage
