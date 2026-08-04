@@ -36,6 +36,10 @@ python al_for_everyone.py --data my_data.csv --model chemeleon \
 python al_for_everyone.py --data measured.csv --library virtual_library.csv \
     --model rf --top_n 500
 
+# Run GP + RF + CheMeleon and rank by consensus
+python al_for_everyone.py --data measured.csv --library virtual_library.csv \
+    --model consensus --top_n 500
+
 # Use a config file (recommended for repeatability)
 python al_for_everyone.py --config config.txt
 ```
@@ -70,7 +74,7 @@ Usage: `python al_for_everyone.py --config config.txt`
 | `--library` | (empty) | | CSV of untested SMILES to screen |
 | `--library_smi_col` | `smiles` | | SMILES column in library |
 | `--top_n` | `1000` | | Top candidates to save |
-| `--model` | `gp` | `gp`, `rf`, `chemeleon` | Predictor model |
+| `--model` | `gp` | `gp`, `rf`, `chemeleon`, `consensus` | Predictor model |
 | `--kernel` | `tanimoto` | `tanimoto`, `rbf`, `matern` | GP kernel (only for `--model gp`) |
 | `--protocol` | `ucb-alternate` | See below | Selection strategy |
 | `--ucb_beta` | `2.0` | | Exploration weight |
@@ -102,7 +106,8 @@ Usage: `python al_for_everyone.py --config config.txt`
 |-------|-------------|-------|
 | `gp` | **Default.** Gaussian Process with Tanimoto kernel on ECFP fingerprints. Best for small datasets (<2000). | `torch gpytorch rdkit-pypi` |
 | `rf` | Random Forest on ECFP fingerprints. Fast, no GPU needed. | `rdkit-pypi scikit-learn` |
-| `chemeleon` | **Best accuracy.** CheMeleon foundation-model fingerprints + Random Forest. R² up to 0.575 vs 0.438 for GP. | `chemprop>=2.2.0` + git clone the chemeleon_repo |
+| `chemeleon` | **Best accuracy.** Pretrained CheMeleon fingerprints + Random Forest. R² up to 0.575 vs 0.438 for GP. | `chemprop>=2.2.0` |
+| `consensus` | Runs GP, RF, and CheMeleon, then averages normalized library predictions. | All dependencies above |
 
 ## Output
 
@@ -111,6 +116,7 @@ Usage: `python al_for_everyone.py --config config.txt`
 | `al_results/al_summary.csv` | Round-by-round metrics (R², recall, picks) |
 | `al_results/honest_test.csv` | Predicted vs true on compounds the model never saw |
 | `al_results/top_candidates.csv` | Ranked library compounds, sorted by predicted activity |
+| `al_results/full_ranked_library.csv` | Full per-model and consensus ranking (`--model consensus`) |
 
 ## Files in this folder
 
@@ -122,10 +128,10 @@ Usage: `python al_for_everyone.py --config config.txt`
 
 ## CheMeleon setup (optional)
 
-For best accuracy, clone the CheMeleon fingerprint repo next to the script:
+Install Chemprop 2.2 or newer. The included helper downloads the pretrained
+CheMeleon checkpoint from Zenodo on first use and caches it in `~/.chemprop`.
 
 ```bash
-git clone https://github.com/JacksonBurns/CheMeleon.git chemeleon_repo
 pip install "chemprop>=2.2.0"
 ```
 

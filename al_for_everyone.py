@@ -14,7 +14,7 @@ Full options: python al_for_everyone.py --help
 
 Author: MJ / Satya — May 2026
 """
-import os, sys, argparse, warnings, numpy as np, pandas as pd
+import os, sys, argparse, subprocess, warnings, numpy as np, pandas as pd
 from tqdm import tqdm
 warnings.filterwarnings("ignore")
 from rdkit import RDLogger; RDLogger.DisableLog("rdApp.*")
@@ -107,8 +107,12 @@ def ecfp4(smiles_list):
 def chemeleon_fingerprints(smiles_list):
     """CheMeleon foundation-model fingerprints via chemprop v2.2+."""
     import torch
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "chemeleon_repo"))
-    from chemeleon_fingerprint import CheMeleonFingerprint
+    here = os.path.abspath(os.path.dirname(__file__))
+    sys.path.insert(0, here)
+    try:
+        from chemeleon_fingerprint import CheMeleonFingerprint
+    except ImportError as exc:
+        raise ImportError("CheMeleon requires chemprop>=2.2.0; use the chemeleon environment") from exc
     fp_gen = CheMeleonFingerprint(device=torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"))
     bs = 1024
@@ -206,7 +210,7 @@ def run_al(fingerprints, target, top2_idx, top5_idx, steps, model_name, kernel,
             r2 = sp = 0.0
 
         print(f"  R{rnd:2d} {method:>12s}: trained={len(selected):3d}  "
-              f"R²={r2:.3f}  ρ={sp:.3f}  "
+              f"R2={r2:.3f}  rho={sp:.3f}  "
               f"top2={cnt2}/{len(top2_idx)}  top5={cnt5}/{len(top5_idx)}")
         records.append({"round": rnd, "method": method, "trained": len(selected),
                         "r2": round(r2,3), "spearman": round(sp,3),
@@ -249,7 +253,7 @@ Run: python al_for_everyone.py @config.txt""")
     p.add_argument("--library", default="")
     p.add_argument("--library_smi_col", default="smiles")
     p.add_argument("--top_n", type=int, default=1000)
-    p.add_argument("--model", default="gp", choices=["gp","rf","chemeleon"])
+    p.add_argument("--model", default="gp", choices=["gp","rf","chemeleon","consensus"])
     p.add_argument("--kernel", default="tanimoto", choices=["tanimoto","rbf","matern"])
     p.add_argument("--protocol", default="ucb-alternate",
                    choices=["random","ucb-balanced","ucb-alternate","ucb-sandwich",
@@ -276,6 +280,40 @@ Run: python al_for_everyone.py @config.txt""")
         args = p.parse_args(shlex.split(' '.join(lines)) + sys.argv[1:])
 
     lower_better = args.lower.strip().lower() in ("true","yes","1","t")
+
+    # Reuse the existing single-model pipeline, then combine complete rankings.
+    if args.model == "consensus":
+        if not args.library:
+            p.error("--model consensus requires --library")
+        lib_size = len(pd.read_csv(args.library, usecols=[args.library_smi_col]))
+        outputs = []
+        for model_name in ("gp", "rf", "chemeleon"):
+            model_out = os.path.join(args.out, model_name)
+            cmd = [sys.executable, __file__]
+            for key, value in vars(args).items():
+                if key not in {"model", "out", "config", "top_n"} and value not in ("", None):
+                    cmd.extend([f"--{key}", str(value)])
+            cmd.extend(["--model", model_name, "--out", model_out,
+                        "--top_n", str(lib_size)])
+            subprocess.run(cmd, check=True)
+            pred = pd.read_csv(os.path.join(model_out, "top_candidates.csv"))
+            outputs.append(pred.rename(columns={"predicted": model_name}))
+
+        ranked = outputs[0]
+        for pred in outputs[1:]:
+            ranked = ranked.merge(pred, on="SMILES")
+        model_cols = ["gp", "rf", "chemeleon"]
+        for col in model_cols:
+            std = ranked[col].std()
+            ranked[f"{col}_z"] = (ranked[col] - ranked[col].mean()) / (std or 1.0)
+        ranked["consensus"] = ranked[[f"{c}_z" for c in model_cols]].mean(axis=1)
+        ranked = ranked.sort_values("consensus", ascending=lower_better).reset_index(drop=True)
+        os.makedirs(args.out, exist_ok=True)
+        ranked.to_csv(os.path.join(args.out, "full_ranked_library.csv"), index=False)
+        ranked.head(args.top_n).to_csv(os.path.join(args.out, "top_candidates.csv"), index=False)
+        print(f"\nConsensus complete: {args.out}/top_candidates.csv")
+        return
+
     os.makedirs(args.out, exist_ok=True)
 
     print(f"\n{'='*65}")
@@ -285,7 +323,7 @@ Run: python al_for_everyone.py @config.txt""")
     print(f"  Model:    {args.model.upper()}  |  Kernel: {args.kernel}")
     print(f"  Protocol: {args.protocol}  |  Budget: {args.init_size}+{args.n_rounds}x{args.batch_size}")
     if args.library:
-        print(f"  Library:  {args.library}  →  Top {args.top_n}")
+        print(f"  Library:  {args.library}  ->  Top {args.top_n}")
     print(f"{'='*65}")
 
     # ── Load data ──
@@ -304,16 +342,11 @@ Run: python al_for_everyone.py @config.txt""")
     # ── Fingerprints ──
     print("\nFingerprinting...")
     if args.model == "chemeleon":
-        try:
-            fingerprints = chemeleon_fingerprints(df["SMILES"].tolist())
-            print(f"  CheMeleon: {fingerprints.shape}  ✓")
-        except ImportError:
-            print("  CheMeleon not available → ECFP fallback")
-            fingerprints = ecfp4(df["SMILES"].tolist())
-            print(f"  ECFP4: {fingerprints.shape}  ✓")
+        fingerprints = chemeleon_fingerprints(df["SMILES"].tolist())
+        print(f"  CheMeleon: {fingerprints.shape}  OK")
     else:
         fingerprints = ecfp4(df["SMILES"].tolist())
-        print(f"  ECFP4: {fingerprints.shape}  ✓")
+        print(f"  ECFP4: {fingerprints.shape}  OK")
 
     # ── Protocol ──
     steps = build_protocol(args.protocol, args.init_size, args.batch_size, args.n_rounds)
@@ -342,15 +375,15 @@ Run: python al_for_everyone.py @config.txt""")
         r2 = r2_score(rt, rp)
         sp, _ = spearmanr(rt, rp)
         print(f"\n{'='*65}")
-        print(f"  Honest test — {len(remaining)} unseen compounds:")
-        print(f"  R²={r2:.4f}  Spearman={sp:.4f}")
+        print(f"  Honest test - {len(remaining)} unseen compounds:")
+        print(f"  R2={r2:.4f}  Spearman={sp:.4f}")
         pd.DataFrame({"SMILES": df["SMILES"].iloc[remaining].values,
                       "true": rt, "predicted": rp}).to_csv(
             f"{args.out}/honest_test.csv", index=False)
-        print(f"  → {args.out}/honest_test.csv")
+        print(f"  -> {args.out}/honest_test.csv")
 
     pd.DataFrame(records).to_csv(f"{args.out}/al_summary.csv", index=False)
-    print(f"  → {args.out}/al_summary.csv")
+    print(f"  -> {args.out}/al_summary.csv")
 
     # ── Library screening ──
     if args.library and os.path.exists(args.library):
@@ -359,10 +392,7 @@ Run: python al_for_everyone.py @config.txt""")
         print(f"\nScreening {len(lib):,} compounds...")
 
         if args.model == "chemeleon":
-            try:
-                fps = chemeleon_fingerprints(lib_smi)
-            except ImportError:
-                fps = ecfp4(lib_smi)
+            fps = chemeleon_fingerprints(lib_smi)
         else:
             fps = ecfp4(lib_smi)
 
@@ -383,7 +413,7 @@ Run: python al_for_everyone.py @config.txt""")
         ranked = pd.DataFrame({"SMILES": lib_smi, "predicted": lpred})
         ranked = ranked.sort_values("predicted", ascending=sort_asc).reset_index(drop=True)
         ranked.head(args.top_n).to_csv(f"{args.out}/top_candidates.csv", index=False)
-        print(f"  → {args.out}/top_candidates.csv (top {args.top_n})")
+        print(f"  -> {args.out}/top_candidates.csv (top {args.top_n})")
         for i, row in ranked.head(10).iterrows():
             print(f"  {i+1:3d}.  {row['predicted']:7.3f}  {row['SMILES'][:60]}...")
 
